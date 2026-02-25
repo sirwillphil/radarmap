@@ -151,11 +151,12 @@
                     var i = (parseInt(slider.value) + 1) % frames.length;
                     slider.value = i;
                     setFrame(i);
-                }, 100);
+                }, 500);
             } else {
+                clearInterval(interval);
+                setFrame(parseInt(slider.value));
                 map.scrollZoom.enable();
                 map.dragPan.enable();
-                clearInterval(interval);
             }
         });
     });
