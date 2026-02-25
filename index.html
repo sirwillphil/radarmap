@@ -104,7 +104,7 @@
             id: 'radar-layer',
             type: 'raster',
             source: 'radar',
-            paint: { 'raster-opacity': 0.85 }
+            paint: { 'raster-opacity': 0.85 , 'raster-resampling': 'linear'}
         });
 
         map.addSource('precip', {
