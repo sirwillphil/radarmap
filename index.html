@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>Radar</title>
+    <meta charset='utf-8'>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel='stylesheet' href='https://unpkg.com/maplibre-gl@5.19.0/dist/maplibre-gl.css' />
+    <script src='https://unpkg.com/maplibre-gl@5.19.0/dist/maplibre-gl.js'></script>
+    <style>
+        body { margin: 0; padding: 0; }
+        html, body, #map { height: 100%; }
+    </style>
+</head>
+<body>
+<div id="map"></div>
+<div id="controls" style="position:absolute; top:10px; left:10px; z-index:10; 
+  background:rgba(0,0,0,0.8); padding:12px 16px; border-radius:8px; color:white; 
+  font-family:monospace; font-size:13px;">
+  <button id="playBtn" style="cursor:pointer;">▶ Play</button>
+  <input type="range" id="timeSlider" min="0" max="7" value="7" style="width:200px; vertical-align:middle;">
+  <span id="timeLabel">Latest</span>
+</div>
+
+<script>
+    // --- URL builders ---
+    function radarUrl(time) {
+        return 'https://opengeo.ncep.noaa.gov/geoserver/conus/conus_bref_qcd/ows?' +
+            'service=WMS&version=1.1.1&request=GetMap' +
+            '&layers=conus_bref_qcd&styles=&crs=EPSG:3857' +
+            '&format=image/png&transparent=true' +
+            '&width=256&height=256' +
+            '&bbox={bbox-epsg-3857}' +
+            '&INTERPOLATIONS=Bilinear' +
+            (time ? '&time=' + time : '');
+    }
+
+    function precipUrl(time) {
+        return 'https://opengeo.ncep.noaa.gov/geoserver/conus/conus_pcpn_typ/ows?' +
+            'service=WMS&version=1.1.1&request=GetMap' +
+            '&layers=conus_pcpn_typ&styles=&srs=EPSG:3857' +
+            '&format=image/png&transparent=true' +
+            '&width=256&height=256' +
+            '&bbox={bbox-epsg-3857}' +
+            (time ? '&time=' + time : '');
+    }
+
+    async function getAvailableTimes() {
+        const url = 'https://opengeo.ncep.noaa.gov/geoserver/conus/conus_bref_qcd/ows' +
+            '?service=WMS&version=1.1.1&request=GetCapabilities';
+        const res = await fetch(url);
+        const text = await res.text();
+        const parser = new DOMParser();
+        const xml = parser.parseFromString(text, 'text/xml');
+        const extents = xml.querySelectorAll('Extent');
+        for (const ext of extents) {
+            if (ext.getAttribute('name') === 'time') {
+                const times = ext.textContent.trim().split(',');
+                return times.slice(-61, -1);
+            }
+        }
+        return [];
+    }
+
+    // --- Map ---
+    const map = new maplibregl.Map({
+        container: 'map',
+        style: {
+            version: 8,
+            sources: {
+                osm: {
+                    type: 'raster',
+                    tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
+                    tileSize: 256,
+                    attribution: '© OpenStreetMap contributors'
+                }
+            },
+            layers: [{
+                id: 'osm-layer',
+                type: 'raster',
+                source: 'osm'
+            }]
+        },
+        center: [-120, 47],
+        zoom: 6
+    });
+
+ 
+    map.on('load', async function() {
+        const frames = await getAvailableTimes();
+        console.log('Available frames:', frames);
+
+        const slider = document.getElementById('timeSlider');
+        const label = document.getElementById('timeLabel');
+        const playBtn = document.getElementById('playBtn');
+
+
+        map.addSource('radar', {
+            type: 'raster',
+            tiles: [radarUrl(frames[frames.length - 1])],
+            tileSize: 256
+        });
+        map.addLayer({
+            id: 'radar-layer',
+            type: 'raster',
+            source: 'radar',
+            paint: { 'raster-opacity': 0.85 }
+        });
+
+        map.addSource('precip', {
+            type: 'raster',
+            tiles: [precipUrl(frames[frames.length - 1])],
+            tileSize: 256
+        });
+        map.addLayer({
+            id: 'precip-layer',
+            type: 'raster',
+            source: 'precip',
+            paint: { 'raster-opacity': 0 }
+        });
+
+
+        slider.max = frames.length - 1;
+        slider.value = frames.length - 1;
+
+        function setFrame(i) {
+            map.getSource('radar').setTiles([radarUrl(frames[i])]);
+            map.getSource('precip').setTiles([precipUrl(frames[i])]);
+            const d = new Date(frames[i]);
+            label.textContent = d.toLocaleTimeString('en-US', {
+                hour: '2-digit',
+                minute: '2-digit',
+                timeZoneName: 'short'
+            });
+        }
+
+        slider.addEventListener('input', function(e) {
+            setFrame(parseInt(e.target.value));
+        });
+
+        var playing = false;
+        var interval = null;
+
+        playBtn.addEventListener('click', function() {
+            playing = !playing;
+            playBtn.textContent = playing ? '❚❚ Pause' : '▶ Play';
+            if (playing) {
+                map.scrollZoom.disable();
+                map.dragPan.disable();
+                interval = setInterval(function() {
+                    var i = (parseInt(slider.value) + 1) % frames.length;
+                    slider.value = i;
+                    setFrame(i);
+                }, 100);
+            } else {
+                map.scrollZoom.enable();
+                map.dragPan.enable();
+                clearInterval(interval);
+            }
+        });
+    });
+</script>
+</body>
+</html>
