@@ -9,6 +9,15 @@
     <style>
         body { margin: 0; padding: 0; }
         html, body, #map { height: 100%; }
+        #legend {
+            position: absolute;
+            bottom: 20px;
+            left: 20px;
+            z-index: 1000;
+            background: white;
+            padding: 5px;
+            border-radius: 4px;
+        }
     </style>
 </head>
 <body>
@@ -20,49 +29,197 @@
   <input type="range" id="timeSlider" min="0" max="7" value="7" style="width:200px; vertical-align:middle;">
   <span id="timeLabel">Latest</span>
 </div>
-
+<div id="legend">
+  <img 
+    src="https://opengeo.ncep.noaa.gov/geoserver/conus/conus_pcpn_typ/ows?service=WMS&version=1.3.0&request=GetLegendGraphic&format=image%2Fpng&width=500&height=30&layer=conus_pcpn_typ" 
+    alt="Precipitation Type Legend"
+  />
+</div>
 <script>
-    // --- URL builders ---
-    function radarUrl(time) {
-        return 'https://opengeo.ncep.noaa.gov/geoserver/conus/conus_bref_qcd/ows?' +
+    // GAUSSIAN SMOOTHING (separable 2-pass)
+    function gaussianSmooth(data, width, height, radius) {
+        if (radius <= 0) return data;
+        var size = radius * 2 + 1;
+        var kernel = new Float32Array(size);
+        var sum = 0;
+        for (var i = 0; i < size; i++) {
+            var d = i - radius;
+            kernel[i] = Math.exp(-(d * d) / (2 * radius));
+            sum += kernel[i];
+        }
+        for (var i = 0; i < size; i++) kernel[i] /= sum;
+
+        var temp = new Float32Array(data.length);
+        for (var y = 0; y < height; y++) {
+            for (var x = 0; x < width; x++) {
+                var val = 0;
+                for (var k = -radius; k <= radius; k++) {
+                    var sx = Math.min(Math.max(x + k, 0), width - 1);
+                    val += data[y * width + sx] * kernel[k + radius];
+                }
+                temp[y * width + x] = val;
+            }
+        }
+
+        var output = new Float32Array(data.length);
+        for (var y = 0; y < height; y++) {
+            for (var x = 0; x < width; x++) {
+                var val = 0;
+                for (var k = -radius; k <= radius; k++) {
+                    var sy = Math.min(Math.max(y + k, 0), height - 1);
+                    val += temp[sy * width + x] * kernel[k + radius];
+                }
+                output[y * width + x] = val;
+            }
+        }
+        return output;
+    }
+
+    function lerp(a, b, t) {
+        t = Math.min(Math.max(t, 0), 1);
+        return a + (b - a) * t;
+    }
+
+    // CUSTOM PROTOCOL: fuse reflectivity + precip type per tile
+    var tileCache = {};
+    var cacheKeys = [];
+    var CACHE_MAX = 300;
+
+    function cacheSet(key, buffer) {
+        if (tileCache[key]) return;
+        tileCache[key] = buffer;
+        cacheKeys.push(key);
+        if (cacheKeys.length > CACHE_MAX) {
+            delete tileCache[cacheKeys.shift()];
+        }
+        console.log('Cache entries:', cacheKeys.length, '/ Max:', CACHE_MAX);
+    }
+    maplibregl.addProtocol('radar', async function(params) {
+        if (tileCache[params.url]) {
+            return { data: tileCache[params.url].slice(0) };
+        }
+
+        var url = params.url.replace('radar://', '');
+        var radarFetchUrl = url.replace(/LAYER_PLACEHOLDER/g, 'conus_bref_qcd');
+        var precipFetchUrl = url.replace(/LAYER_PLACEHOLDER/g, 'conus_pcpn_typ');
+
+        try {
+            var responses = await Promise.all([
+                fetch(radarFetchUrl),
+                fetch(precipFetchUrl)
+            ]);
+
+            var radarBmp = await createImageBitmap(await responses[0].blob());
+            var precipBmp = await createImageBitmap(await responses[1].blob());
+
+            var canvas = new OffscreenCanvas(256, 256);
+            var ctx = canvas.getContext('2d');
+
+            // Read radar pixels
+            ctx.drawImage(radarBmp, 0, 0, 256, 256);
+            var radarPixels = ctx.getImageData(0, 0, 256, 256).data;
+
+            // Read precip type pixels
+            ctx.clearRect(0, 0, 256, 256);
+            ctx.drawImage(precipBmp, 0, 0, 256, 256);
+            var precipPixels = ctx.getImageData(0, 0, 256, 256).data;
+
+            // Extract intensity from reflectivity
+            var intensity = new Float32Array(256 * 256);
+            for (var i = 0; i < intensity.length; i++) {
+                var idx = i * 4;
+                if (radarPixels[idx + 3] < 10) {
+                    intensity[i] = 0;
+                } else {
+                    intensity[i] = Math.max(radarPixels[idx], radarPixels[idx + 1], radarPixels[idx + 2]) / 255;
+                }
+            }
+
+            // Smooth the intensity
+            var smoothed = gaussianSmooth(intensity, 256, 256, 1);
+
+            //var smoothed = intensity
+
+            // Combine: precip type color modulated by smoothed intensity
+            var output = ctx.createImageData(256, 256);
+            for (var i = 0; i < 256 * 256; i++) {
+                var idx = i * 4;
+                var s = smoothed[i];
+
+                if (s < 0.08) {
+                    output.data[idx] = 0;
+                    output.data[idx + 1] = 0;
+                    output.data[idx + 2] = 0;
+                    output.data[idx + 3] = 0;
+                    continue;
+                }
+
+                // Use precip type color if available, otherwise radar color
+                // Detect precip type from color
+                var pA = precipPixels[idx + 3];
+                var r, g, b;
+
+                if (pA > 10) {
+                    r = precipPixels[idx];
+                    g = precipPixels[idx + 1];
+                    b = precipPixels[idx + 2];
+                } else {
+                    r = radarPixels[idx];
+                    g = radarPixels[idx + 1];
+                    b = radarPixels[idx + 2];
+                }
+                        
+                output.data[idx] = r;
+                output.data[idx + 1] = g;
+                output.data[idx + 2] = b;
+                output.data[idx + 3] = Math.round(lerp(50, 255, s));
+            }
+
+            ctx.putImageData(output, 0, 0);
+            var blob = await canvas.convertToBlob();
+            var buffer = await blob.arrayBuffer();
+            cacheSet(params.url, buffer);
+            return { data: buffer.slice(0) };
+
+        } catch (e) {
+            var canvas = new OffscreenCanvas(256, 256);
+            var blob = await canvas.convertToBlob();
+            return { data: await blob.arrayBuffer() };
+        }
+    });
+
+    // TILE URL (uses custom radar:// protocol)
+    function tileUrl(time) {
+        return 'radar://https://opengeo.ncep.noaa.gov/geoserver/conus/LAYER_PLACEHOLDER/ows?' +
             'service=WMS&version=1.1.1&request=GetMap' +
-            '&layers=conus_bref_qcd&styles=&crs=EPSG:3857' +
+            '&layers=LAYER_PLACEHOLDER&styles=&srs=EPSG:3857' +
             '&format=image/png&transparent=true' +
-            '&width=256&height=256' +
-            '&bbox={bbox-epsg-3857}' +
             '&INTERPOLATIONS=Bilinear' +
-            (time ? '&time=' + time : '');
-    }
-
-    function precipUrl(time) {
-        return 'https://opengeo.ncep.noaa.gov/geoserver/conus/conus_pcpn_typ/ows?' +
-            'service=WMS&version=1.1.1&request=GetMap' +
-            '&layers=conus_pcpn_typ&styles=&srs=EPSG:3857' +
-            '&format=image/png&transparent=true' +
             '&width=256&height=256' +
             '&bbox={bbox-epsg-3857}' +
             (time ? '&time=' + time : '');
     }
 
+    // FETCH AVAILABLE TIMESTAMPS
     async function getAvailableTimes() {
-        const url = 'https://opengeo.ncep.noaa.gov/geoserver/conus/conus_bref_qcd/ows' +
+        var url = 'https://opengeo.ncep.noaa.gov/geoserver/conus/conus_bref_qcd/ows' +
             '?service=WMS&version=1.1.1&request=GetCapabilities';
-        const res = await fetch(url);
-        const text = await res.text();
-        const parser = new DOMParser();
-        const xml = parser.parseFromString(text, 'text/xml');
-        const extents = xml.querySelectorAll('Extent');
-        for (const ext of extents) {
+        var res = await fetch(url);
+        var text = await res.text();
+        var parser = new DOMParser();
+        var xml = parser.parseFromString(text, 'text/xml');
+        var extents = xml.querySelectorAll('Extent');
+        for (var ext of extents) {
             if (ext.getAttribute('name') === 'time') {
-                const times = ext.textContent.trim().split(',');
-                return times.slice(-61, -1);
+                var times = ext.textContent.trim().split(',');
+                return times
             }
         }
         return [];
     }
 
-    // --- Map ---
-    const map = new maplibregl.Map({
+    // MAP
+    var map = new maplibregl.Map({
         container: 'map',
         style: {
             version: 8,
@@ -85,48 +242,72 @@
         maxZoom: 12
     });
 
- 
+    // ON LOAD
+    var initialLoadDone = false;
     map.on('load', async function() {
-        const frames = await getAvailableTimes();
-        console.log('Available frames:', frames);
+        var frames = await getAvailableTimes();
+        var currentFrame = 0;
 
-        const slider = document.getElementById('timeSlider');
-        const label = document.getElementById('timeLabel');
-        const playBtn = document.getElementById('playBtn');
+        var slider = document.getElementById('timeSlider');
+        var label = document.getElementById('timeLabel');
+        var playBtn = document.getElementById('playBtn');
 
+        var POOL_SIZE = 20;
 
-        map.addSource('radar', {
-            type: 'raster',
-            tiles: [radarUrl(frames[frames.length - 1])],
-            tileSize: 256
-        });
-        map.addLayer({
-            id: 'radar-layer',
-            type: 'raster',
-            source: 'radar',
-            paint: { 'raster-opacity': 0.85 , 'raster-resampling': 'linear'}
-        });
+        playBtn.disabled = true;
+        playBtn.textContent = '⏳ loading...';
 
-        map.addSource('precip', {
-            type: 'raster',
-            tiles: [precipUrl(frames[frames.length - 1])],
-            tileSize: 256
-        });
-        map.addLayer({
-            id: 'precip-layer',
-            type: 'raster',
-            source: 'precip',
-            paint: { 'raster-opacity': 0 }
-        });
+        async function preloadAllFrames() {
+            for (var i = 0; i < frames.length; i++) {
+                map.addSource('radar-' + i, {
+                    type: 'raster',
+                    tiles: [tileUrl(frames[i])],
+                    tileSize: 256
+                });
+                map.addLayer({
+                    id: 'radar-' + i,
+                    type: 'raster',
+                    source: 'radar-' + i,
+                    paint: { 'raster-opacity': 0, 'raster-resampling': 'linear' }
+                });
+            }
 
+            // Show first frame immediately
+            map.setPaintProperty('radar-0', 'raster-opacity', 0.85);
+            await new Promise(function(resolve) {
+                map.once('idle', resolve);
+            });
 
+            // Load rest in batches of 5 with percent
+            var bgIdx = 1;
+            while (bgIdx < frames.length) {
+                var end = Math.min(bgIdx + 5, frames.length);
+                for (var i = bgIdx; i < end; i++) {
+                    map.setPaintProperty('radar-' + i, 'raster-opacity', 0.01);
+                }
+                await new Promise(function(resolve) {
+                    map.once('idle', resolve);
+                });
+                for (var i = bgIdx; i < end; i++) {
+                    map.setPaintProperty('radar-' + i, 'raster-opacity', 0);
+                }
+                playBtn.textContent = '⏳ ' + Math.round(end / frames.length * 100) + '%';
+                bgIdx = end;
+            }
+
+            playBtn.disabled = false;
+            playBtn.textContent = '▶ Play';
+            initialLoadDone = true;
+        }
+
+        preloadAllFrames();
+
+        // Slider setup
         slider.max = frames.length - 1;
-        slider.value = frames.length - 1;
+        slider.value = 0;
 
-        function setFrame(i) {
-            map.getSource('radar').setTiles([radarUrl(frames[i])]);
-            map.getSource('precip').setTiles([precipUrl(frames[i])]);
-            const d = new Date(frames[i]);
+        function updateLabel(i) {
+            var d = new Date(frames[i]);
             label.textContent = d.toLocaleTimeString('en-US', {
                 hour: '2-digit',
                 minute: '2-digit',
@@ -134,27 +315,67 @@
             });
         }
 
-        slider.addEventListener('input', function(e) {
-            setFrame(parseInt(e.target.value));
+        updateLabel(0);
+
+        map.on('moveend', function() {
+            if (playing) return;
+
+            playBtn.disabled = true;
+
+            // Reload current frame immediately
+            map.getSource('radar-' + currentFrame).setTiles([tileUrl(frames[currentFrame])]);
+            map.setPaintProperty('radar-' + currentFrame, 'raster-opacity', 0.85);
+
+            var loaded = 0;
+            var i = 0;
+            var bg = setInterval(function() {
+                if (i >= frames.length) {
+                    clearInterval(bg);
+                    playBtn.disabled = false;
+                    playBtn.textContent = '▶ Play';
+                    return;
+                }
+                if (i !== currentFrame) {
+                    map.getSource('radar-' + i).setTiles([tileUrl(frames[i])]);
+                    map.setPaintProperty('radar-' + i, 'raster-opacity', 0.01);
+                }
+                loaded++;
+                playBtn.textContent = '⏳ ' + Math.round(loaded / frames.length * 100) + '%';
+                i++;
+            }, 100);
         });
 
-        let playing = false;
-        let interval = null;
+        // Manual scrub
+        slider.addEventListener('input', function(e) {
+            map.setPaintProperty('radar-' + currentFrame, 'raster-opacity', 0);
+            currentFrame = parseInt(e.target.value);
+            map.setPaintProperty('radar-' + currentFrame, 'raster-opacity', 0.85);
+            updateLabel(currentFrame);
+        });
+
+        // Play/pause with instant toggle
+        var playing = false;
+        var animInterval = null;
 
         playBtn.addEventListener('click', function() {
             playing = !playing;
             playBtn.textContent = playing ? '❚❚ Pause' : '▶ Play';
+
+            if (!initialLoadDone) return;
+
             if (playing) {
                 map.scrollZoom.disable();
                 map.dragPan.disable();
-                interval = setInterval(function() {
-                    var i = (parseInt(slider.value) + 1) % frames.length;
-                    slider.value = i;
-                    setFrame(i);
-                }, 500);
+                animInterval = setInterval(function() {
+                    map.setPaintProperty('radar-' + currentFrame, 'raster-opacity', 0);
+                    currentFrame = (currentFrame + 1) % frames.length;
+                    map.setPaintProperty('radar-' + currentFrame, 'raster-opacity', 0.85);
+                    slider.value = currentFrame;
+                    updateLabel(currentFrame);
+                }, 50);
             } else {
-                clearInterval(interval);
-                setFrame(parseInt(slider.value));
+                clearInterval(animInterval);
+                animInterval = null;
                 map.scrollZoom.enable();
                 map.dragPan.enable();
             }
