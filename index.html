@@ -288,7 +288,8 @@
                     map.once('idle', resolve);
                 });
                 for (var i = bgIdx; i < end; i++) {
-                    map.setPaintProperty('radar-' + i, 'raster-opacity', 0);
+                    map.setPaintProperty('radar-' + i, 'raster-opacity', 0.85);
+                    map.setLayoutProperty('radar-' + i, 'visibility', 'none');
                 }
                 playBtn.textContent = '⏳ ' + Math.round(end / frames.length * 100) + '%';
                 bgIdx = end;
@@ -296,6 +297,7 @@
 
             playBtn.disabled = false;
             playBtn.textContent = '▶ Play';
+            map.setLayoutProperty('radar-0', 'visibility', 'visible');
             initialLoadDone = true;
         }
 
@@ -315,46 +317,66 @@
         }
 
         updateLabel(0);
+        var playing = false;
+        var animInterval = null;
 
-        map.on('moveend', function() {
+        map.on('moveend', async function() {
             if (playing) return;
+            if (!initialLoadDone) return;
 
             playBtn.disabled = true;
+            tileCache = {};
+            cacheKeys = [];
 
-            // Reload current frame immediately
+            // Reload current frame first
             map.getSource('radar-' + currentFrame).setTiles([tileUrl(frames[currentFrame])]);
+            map.setLayoutProperty('radar-' + currentFrame, 'visibility', 'visible');
             map.setPaintProperty('radar-' + currentFrame, 'raster-opacity', 0.85);
 
-            var loaded = 0;
-            var i = 0;
-            var bg = setInterval(function() {
-                if (i >= frames.length) {
-                    clearInterval(bg);
-                    playBtn.disabled = false;
-                    playBtn.textContent = '▶ Play';
-                    return;
+            await new Promise(function(resolve) {
+                map.once('idle', resolve);
+            });
+
+            // Reload rest in batches — same pattern as preloadAllFrames
+            var bgIdx = 0;
+            while (bgIdx < frames.length) {
+                var end = Math.min(bgIdx + 5, frames.length);
+                for (var i = bgIdx; i < end; i++) {
+                    if (i !== currentFrame) {
+                        map.setLayoutProperty('radar-' + i, 'visibility', 'visible');
+                        map.setPaintProperty('radar-' + i, 'raster-opacity', 0.01);
+                        map.getSource('radar-' + i).setTiles([tileUrl(frames[i])]);
+                    }
                 }
-                if (i !== currentFrame) {
-                    map.getSource('radar-' + i).setTiles([tileUrl(frames[i])]);
-                    map.setPaintProperty('radar-' + i, 'raster-opacity', 0.01);
+
+                await new Promise(function(resolve) {
+                    map.once('idle', resolve);
+                });
+
+                for (var i = bgIdx; i < end; i++) {
+                    if (i !== currentFrame) {
+                        map.setPaintProperty('radar-' + i, 'raster-opacity', 0.85);
+                        map.setLayoutProperty('radar-' + i, 'visibility', 'none');
+                    }
                 }
-                loaded++;
-                playBtn.textContent = '⏳ ' + Math.round(loaded / frames.length * 100) + '%';
-                i++;
-            }, 100);
+
+                playBtn.textContent = '⏳ ' + Math.round(end / frames.length * 100) + '%';
+                bgIdx = end;
+            }
+
+            playBtn.disabled = false;
+            playBtn.textContent = '▶ Play';
         });
 
         // Manual scrub
         slider.addEventListener('input', function(e) {
-            map.setPaintProperty('radar-' + currentFrame, 'raster-opacity', 0);
+            map.setLayoutProperty('radar-' + currentFrame, 'visibility', 'none');
             currentFrame = parseInt(e.target.value);
-            map.setPaintProperty('radar-' + currentFrame, 'raster-opacity', 0.85);
+            map.setLayoutProperty('radar-' + currentFrame, 'visibility', 'visible');
             updateLabel(currentFrame);
         });
 
         // Play/pause with instant toggle
-        var playing = false;
-        var animInterval = null;
 
         playBtn.addEventListener('click', function() {
             playing = !playing;
@@ -366,12 +388,12 @@
                 map.scrollZoom.disable();
                 map.dragPan.disable();
                 animInterval = setInterval(function() {
-                    map.setPaintProperty('radar-' + currentFrame, 'raster-opacity', 0);
+                    map.setLayoutProperty('radar-' + currentFrame, 'visibility', 'none');
                     currentFrame = (currentFrame + 1) % frames.length;
-                    map.setPaintProperty('radar-' + currentFrame, 'raster-opacity', 0.85);
+                    map.setLayoutProperty('radar-' + currentFrame, 'visibility', 'visible');
                     slider.value = currentFrame;
                     updateLabel(currentFrame);
-                }, 50);
+                }, 100);
             } else {
                 clearInterval(animInterval);
                 animInterval = null;
