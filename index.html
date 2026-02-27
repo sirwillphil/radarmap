@@ -92,7 +92,6 @@
         if (cacheKeys.length > CACHE_MAX) {
             delete tileCache[cacheKeys.shift()];
         }
-        console.log('Cache entries:', cacheKeys.length, '/ Max:', CACHE_MAX);
     }
     maplibregl.addProtocol('radar', async function(params) {
         if (tileCache[params.url]) {
